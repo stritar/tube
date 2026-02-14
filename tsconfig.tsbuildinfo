@@ -1,0 +1,1 @@
+{"root":["./src/main.ts","./src/game/boot.ts","./src/game/main-scene.ts","./src/sim/actions.ts","./src/sim/index.ts","./src/sim/state.ts","./src/sim/tick.ts","./tests/sim/tick.test.ts"],"version":"5.6.3"}
