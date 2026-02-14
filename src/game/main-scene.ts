@@ -1,19 +1,28 @@
 import Phaser from 'phaser';
 import type { SimState, Station } from '../sim/state.js';
-import { createInitialState, placeStation, addSegment, tick } from '../sim/index.js';
+import { createInitialState, placeStation, addPlannedLine, tick, CONSTRUCTION_TICKS } from '../sim/index.js';
 
 const GRID_W = 20;
 const GRID_H = 15;
 const CELL = 40;
 const STATION_R = 12;
 const TRAIN_R = 6;
+const COLOR_CONSTRUCTED = 0x4ecdc4;
+const COLOR_PLANNED = 0x6c757d; // neutral grey
 
 type BuildMode = 'station' | 'line' | 'play';
+
+interface GridPoint {
+  x: number;
+  y: number;
+}
 
 export class MainScene extends Phaser.Scene {
   private state: SimState = createInitialState();
   private buildMode: BuildMode = 'station';
-  private lineFirstId: string | null = null;
+  /** Current path while dragging (line mode); committed to state on pointer up */
+  private dragPath: GridPoint[] = [];
+  private isDragging = false;
   private tickTimer = 0;
   private tickIntervalMs = 200;
   private graphics!: Phaser.GameObjects.Graphics;
@@ -36,6 +45,8 @@ export class MainScene extends Phaser.Scene {
     this.makeButton(160, y, 'Play', () => this.setMode('play'));
 
     this.input.on('pointerdown', this.onPointerDown, this);
+    this.input.on('pointermove', this.onPointerMove, this);
+    this.input.on('pointerup', this.onPointerUp, this);
     this.cameras.main.setBounds(0, 0, GRID_W * CELL, GRID_H * CELL);
   }
 
@@ -49,10 +60,11 @@ export class MainScene extends Phaser.Scene {
 
   private setMode(mode: BuildMode) {
     this.buildMode = mode;
-    this.lineFirstId = null;
+    this.dragPath = [];
+    this.isDragging = false;
     const labels: Record<BuildMode, string> = {
       station: 'Place station',
-      line: 'Draw line (click 2 stations)',
+      line: 'Draw line (drag route)',
       play: 'Play',
     };
     this.modeText.setText('Mode: ' + labels[mode]);
@@ -76,6 +88,57 @@ export class MainScene extends Phaser.Scene {
     return undefined;
   }
 
+  /** Draw a path with a "built" portion (0..1) in teal, the rest in grey — for construction animation. */
+  private drawPlannedLineWithBuildProgress(
+    g: Phaser.GameObjects.Graphics,
+    path: GridPoint[],
+    constructionRemainingTicks: number
+  ) {
+    if (path.length < 2) return;
+    // Interpolate progress between sim ticks so the line grows smoothly each frame
+    const effectiveRemaining =
+      this.buildMode === 'play'
+        ? constructionRemainingTicks - this.tickTimer / this.tickIntervalMs
+        : constructionRemainingTicks;
+    const progress = Math.max(0, Math.min(1, 1 - effectiveRemaining / CONSTRUCTION_TICKS));
+
+    const pixels: { x: number; y: number }[] = path.map((p) => this.gridToPixel(p.x, p.y));
+    const segmentLengths: number[] = [];
+    let totalLength = 0;
+    for (let i = 0; i < pixels.length - 1; i++) {
+      const len = Phaser.Math.Distance.Between(pixels[i].x, pixels[i].y, pixels[i + 1].x, pixels[i + 1].y);
+      segmentLengths.push(len);
+      totalLength += len;
+    }
+    if (totalLength <= 0) return;
+    const builtLength = progress * totalLength;
+
+    let acc = 0;
+    for (let i = 0; i < segmentLengths.length; i++) {
+      const segLen = segmentLengths[i];
+      const a = pixels[i];
+      const b = pixels[i + 1];
+      if (acc + segLen <= builtLength) {
+        g.lineStyle(4, COLOR_CONSTRUCTED);
+        g.lineBetween(a.x, a.y, b.x, b.y);
+        acc += segLen;
+      } else if (acc < builtLength) {
+        const t = (builtLength - acc) / segLen;
+        const midX = a.x + (b.x - a.x) * t;
+        const midY = a.y + (b.y - a.y) * t;
+        g.lineStyle(4, COLOR_CONSTRUCTED);
+        g.lineBetween(a.x, a.y, midX, midY);
+        g.lineStyle(4, COLOR_PLANNED);
+        g.lineBetween(midX, midY, b.x, b.y);
+        acc = builtLength;
+      } else {
+        g.lineStyle(4, COLOR_PLANNED);
+        g.lineBetween(a.x, a.y, b.x, b.y);
+        acc += segLen;
+      }
+    }
+  }
+
   private onPointerDown(ptr: Phaser.Input.Pointer) {
     const world = this.cameras.main.getWorldPoint(ptr.x, ptr.y);
     if (this.buildMode === 'play') return;
@@ -88,18 +151,32 @@ export class MainScene extends Phaser.Scene {
     }
 
     if (this.buildMode === 'line') {
-      const st = this.stationAtPixel(world.x, world.y);
-      if (!st) return;
-      if (this.lineFirstId === null) {
-        this.lineFirstId = st.id;
-        return;
-      }
-      if (this.lineFirstId === st.id) return;
-      const { state } = addSegment(this.state, this.lineFirstId, st.id);
-      this.state = state;
-      this.lineFirstId = null;
+      const { gx, gy } = this.pixelToGrid(world.x, world.y);
+      this.dragPath = [{ x: gx, y: gy }];
+      this.isDragging = true;
       this.draw();
     }
+  }
+
+  private onPointerMove(ptr: Phaser.Input.Pointer) {
+    if (this.buildMode !== 'line' || !this.isDragging || this.dragPath.length === 0) return;
+    const world = this.cameras.main.getWorldPoint(ptr.x, ptr.y);
+    const { gx, gy } = this.pixelToGrid(world.x, world.y);
+    const last = this.dragPath[this.dragPath.length - 1];
+    if (last.x !== gx || last.y !== gy) {
+      this.dragPath = [...this.dragPath, { x: gx, y: gy }];
+      this.draw();
+    }
+  }
+
+  private onPointerUp() {
+    if (this.buildMode !== 'line' || !this.isDragging) return;
+    this.isDragging = false;
+    if (this.dragPath.length >= 2) {
+      this.state = addPlannedLine(this.state, this.dragPath);
+    }
+    this.dragPath = [];
+    this.draw();
   }
 
   private draw() {
@@ -111,18 +188,32 @@ export class MainScene extends Phaser.Scene {
     for (let x = 0; x <= GRID_W; x++) g.lineBetween(x * CELL, 0, x * CELL, GRID_H * CELL);
     for (let y = 0; y <= GRID_H; y++) g.lineBetween(0, y * CELL, GRID_W * CELL, y * CELL);
 
-    // Segments / lines
+    // Planned lines (under construction) — teal grows from A to B over 10s, rest stays grey
+    for (const planned of this.state.plannedLines) {
+      this.drawPlannedLineWithBuildProgress(g, planned.path, planned.constructionRemainingTicks);
+    }
+
+    // Drag preview (current route being drawn)
+    if (this.dragPath.length >= 2) {
+      g.lineStyle(4, COLOR_PLANNED);
+      for (let i = 0; i < this.dragPath.length - 1; i++) {
+        const a = this.gridToPixel(this.dragPath[i].x, this.dragPath[i].y);
+        const b = this.gridToPixel(this.dragPath[i + 1].x, this.dragPath[i + 1].y);
+        g.lineBetween(a.x, a.y, b.x, b.y);
+      }
+    }
+
+    // Constructed lines — teal (segment endpoints are nodes)
     for (const line of this.state.lines) {
-      const color = 0x4ecdc4;
-      g.lineStyle(4, color);
+      g.lineStyle(4, COLOR_CONSTRUCTED);
       for (const segId of line.segmentIds) {
         const seg = this.state.segments.get(segId);
         if (!seg) continue;
-        const from = this.state.stations.find((s) => s.id === seg.fromStationId);
-        const to = this.state.stations.find((s) => s.id === seg.toStationId);
-        if (!from || !to) continue;
-        const a = this.gridToPixel(from.x, from.y);
-        const b = this.gridToPixel(to.x, to.y);
+        const fromNode = this.state.nodes.find((n) => n.id === seg.fromNodeId);
+        const toNode = this.state.nodes.find((n) => n.id === seg.toNodeId);
+        if (!fromNode || !toNode) continue;
+        const a = this.gridToPixel(fromNode.x, fromNode.y);
+        const b = this.gridToPixel(toNode.x, toNode.y);
         g.lineBetween(a.x, a.y, b.x, b.y);
       }
     }
@@ -130,20 +221,10 @@ export class MainScene extends Phaser.Scene {
     // Stations
     for (const s of this.state.stations) {
       const pos = this.gridToPixel(s.x, s.y);
-      g.fillStyle(0x4ecdc4, 1);
+      g.fillStyle(COLOR_CONSTRUCTED, 1);
       g.fillCircle(pos.x, pos.y, STATION_R);
       g.lineStyle(2, 0x2a2a4a);
       g.strokeCircle(pos.x, pos.y, STATION_R);
-    }
-
-    // Line first selection
-    if (this.buildMode === 'line' && this.lineFirstId) {
-      const first = this.state.stations.find((s) => s.id === this.lineFirstId);
-      if (first) {
-        const pos = this.gridToPixel(first.x, first.y);
-        g.lineStyle(2, 0xffe66d);
-        g.strokeCircle(pos.x, pos.y, STATION_R + 4);
-      }
     }
 
     // Trains
@@ -153,10 +234,11 @@ export class MainScene extends Phaser.Scene {
       const segId = line.segmentIds[t.segmentIndex];
       const seg = this.state.segments.get(segId);
       if (!seg) continue;
-      const from = this.state.stations.find((s) => s.id === seg.fromStationId)!;
-      const to = this.state.stations.find((s) => s.id === seg.toStationId)!;
-      const a = this.gridToPixel(from.x, from.y);
-      const b = this.gridToPixel(to.x, to.y);
+      const fromNode = this.state.nodes.find((n) => n.id === seg.fromNodeId);
+      const toNode = this.state.nodes.find((n) => n.id === seg.toNodeId);
+      if (!fromNode || !toNode) continue;
+      const a = this.gridToPixel(fromNode.x, fromNode.y);
+      const b = this.gridToPixel(toNode.x, toNode.y);
       const x = a.x + (b.x - a.x) * t.progress;
       const y = a.y + (b.y - a.y) * t.progress;
       g.fillStyle(0xffe66d, 1);
