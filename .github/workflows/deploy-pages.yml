@@ -38,7 +38,7 @@ jobs:
           GITHUB_PAGES: "true"
 
       - name: Upload artifact
-        uses: actions/upload-pages-artifact@3
+        uses: actions/upload-pages-artifact@v2
         with:
           path: dist
 
@@ -48,4 +48,4 @@ jobs:
     environment: pages
     steps:
       - name: Deploy
-        uses: actions/deploy-pages@4
+        uses: actions/deploy-pages@v4
